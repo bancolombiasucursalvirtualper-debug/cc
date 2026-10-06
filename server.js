@@ -1,4 +1,5 @@
 const http = require("http");
+const { spawn } = require("child_process");
 
 const ALLOWED = {
   winsport: "http://138.121.15.230:9002/WIN-SPORT/index.m3u8",
@@ -11,95 +12,67 @@ const CORS = {
   "cache-control": "no-store",
 };
 
-async function proxyM3U8(targetUrl, proxyBase, res) {
-  try {
-    const r = await fetch(targetUrl, {
-      headers: { "user-agent": "VLC/3.0.20 LibVLC/3.0.20" },
-      signal: AbortSignal.timeout(15000),
-    });
-    if (!r.ok) {
-      res.writeHead(502, CORS);
-      res.end("Canal no disponible");
-      return;
-    }
-    const text = await r.text();
-    if (!text.includes("#EXT")) {
-      res.writeHead(502, CORS);
-      res.end("Sin señal");
-      return;
-    }
-
-    const base = new URL(targetUrl);
-    const rewritten = text.split(/\r?\n/).map(line => {
-      const t = line.trim();
-      if (!t || t.startsWith("#")) return line;
-      try {
-        const abs = new URL(t, base).toString();
-        return `${proxyBase}?raw=${encodeURIComponent(abs)}`;
-      } catch {
-        return line;
-      }
-    }).join("\n");
-
-    res.writeHead(200, { ...CORS, "content-type": "application/vnd.apple.mpegurl" });
-    res.end(rewritten);
-  } catch (e) {
-    res.writeHead(502, CORS);
-    res.end("Error: " + e.message);
-  }
-}
-
 const PORT = process.env.PORT || 3000;
 
-http.createServer(async (req, res) => {
+http.createServer((req, res) => {
   const url = new URL(req.url, `http://localhost:${PORT}`);
-  const proxyBase = `https://${req.headers.host}/proxy`;
 
-  if (url.pathname === "/proxy") {
-    const id  = url.searchParams.get("id");
-    const raw = url.searchParams.get("raw");
-
-    if (id) {
-      const target = ALLOWED[id];
-      if (!target) {
-        res.writeHead(404, CORS);
-        res.end("Canal no encontrado");
-        return;
-      }
-      return proxyM3U8(target, proxyBase, res);
-    }
-
-    if (raw) {
-      try {
-        const r = await fetch(raw, {
-          headers: { "user-agent": "VLC/3.0.20 LibVLC/3.0.20" },
-          signal: AbortSignal.timeout(15000),
-        });
-        const ct = r.headers.get("content-type") || "video/mp2t";
-        if (ct.includes("mpegurl") || raw.includes(".m3u8")) {
-          return proxyM3U8(raw, proxyBase, res);
-        }
-        res.writeHead(r.status, { ...CORS, "content-type": ct });
-        const reader = r.body.getReader();
-        const pump = async () => {
-          const { done, value } = await reader.read();
-          if (done) { res.end(); return; }
-          res.write(value);
-          pump();
-        };
-        pump();
-      } catch (e) {
-        res.writeHead(502, CORS);
-        res.end("Error: " + e.message);
-      }
-      return;
-    }
-
-    res.writeHead(400, CORS);
-    res.end("Usa ?id=winsport, ?id=local1 o ?id=local2");
+  if (url.pathname !== "/proxy") {
+    res.writeHead(200);
+    res.end("Proxy activo con FFmpeg ✓");
     return;
   }
 
-  res.writeHead(200);
-  res.end("Proxy activo ✓");
-}).listen(PORT, () => console.log(`Proxy corriendo en puerto ${PORT}`));
+  const id = url.searchParams.get("id");
+  const target = ALLOWED[id];
+
+  if (!target) {
+    res.writeHead(404, CORS);
+    res.end("Canal no encontrado. Usa ?id=winsport, ?id=local1 o ?id=local2");
+    return;
+  }
+
+  console.log(`[proxy] Iniciando stream: ${id} → ${target}`);
+
+  res.writeHead(200, {
+    ...CORS,
+    "content-type": "video/mp4",
+    "transfer-encoding": "chunked",
+  });
+
+  const ff = spawn("ffmpeg", [
+    "-re",
+    "-i", target,
+    "-user_agent", "VLC/3.0.20 LibVLC/3.0.20",
+    "-vcodec", "libx264",
+    "-preset", "ultrafast",
+    "-tune", "zerolatency",
+    "-b:v", "1000k",
+    "-acodec", "aac",
+    "-b:a", "128k",
+    "-f", "mp4",
+    "-movflags", "frag_keyframe+empty_moov+faststart",
+    "-loglevel", "warning",
+    "-",
+  ]);
+
+  ff.stdout.pipe(res);
+
+  ff.stderr.on("data", (d) => console.error("[ffmpeg]", d.toString().trim()));
+
+  ff.on("error", (e) => {
+    console.error("[ffmpeg error]", e.message);
+    try { res.end(); } catch {}
+  });
+
+  ff.on("close", (code) => {
+    console.log(`[ffmpeg] cerrado con código ${code}`);
+    try { res.end(); } catch {}
+  });
+
+  req.on("close", () => {
+    console.log(`[proxy] cliente desconectado, matando ffmpeg`);
+    ff.kill("SIGKILL");
+  });
+
+}).listen(PORT, () => console.log(`Proxy con FFmpeg corriendo en puerto ${PORT}`));
