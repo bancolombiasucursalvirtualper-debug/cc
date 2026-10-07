@@ -51,8 +51,8 @@ function spawnFf(sid) {
   const ff = spawn("ffmpeg", [
     "-hide_banner", "-loglevel", "warning",
     "-user_agent", UA,
-    "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_on_network_error", "1",
-    "-reconnect_delay_max", "5", "-rw_timeout", "15000000",
+    "-reconnect", "1", "-reconnect_streamed", "1",
+    "-reconnect_delay_max", "5",
     "-fflags", "+genpts+discardcorrupt",
     "-i", s.target,
     "-map", "0:v:0?", "-map", "0:a:0?",
@@ -66,8 +66,11 @@ function spawnFf(sid) {
     outPath,
   ]);
   s.ffmpeg = ff;
-  ff.stderr.on("data", d => process.stdout.write(`[ffmpeg:${sid.slice(0,6)}] ${d}`));
-  ff.on("error", e => console.error(`[ffmpeg error] ${e.message}`));
+  ff.stderr.on("data", d => {
+    s.log = ((s.log || "") + d).slice(-3000);
+    process.stdout.write(`[ffmpeg:${sid.slice(0,6)}] ${d}`);
+  });
+  ff.on("error", e => { s.log = "ffmpeg no instalado o falló: " + e.message; console.error(`[ffmpeg error] ${e.message}`); });
   ff.on("close", code => {
     // Se cayó la señal: si alguien sigue mirando, la volvemos a prender.
     if (s.closed) return;
@@ -159,6 +162,31 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Para VLC: GET /play/local1.m3u8 -> arranca el canal y entrega la lista directa
+  const play = url.pathname.match(/^\/play\/([a-z0-9]+)(\.m3u8)?$/i);
+  if (play) {
+    const target = ALLOWED[play[1]];
+    if (!target) { res.writeHead(404, CORS); res.end("Canal no encontrado"); return; }
+    const sid = startSession(target);
+    try {
+      await waitForFile(path.join(sessions.get(sid).dir, "live.m3u8"), 25000);
+      res.writeHead(302, { ...CORS, location: `/hls/${sid}/live.m3u8` });
+      res.end();
+    } catch {
+      res.writeHead(502, CORS);
+      res.end("El canal no arrancó. Revisa /status");
+    }
+    return;
+  }
+
+  // Diagnóstico: GET /status
+  if (url.pathname === "/status") {
+    const out = [...sessions].map(([sid, x]) => ({ sid, target: x.target, restarts: x.restarts || 0, log: x.log || "" }));
+    res.writeHead(200, { ...CORS, "content-type": "application/json" });
+    res.end(JSON.stringify(out, null, 2));
+    return;
+  }
+
   // Relé genérico: GET /fetch?u=<url>&k=<RELAY_KEY>
   if (url.pathname === "/fetch") {
     await relayFetch(req, res, url);
@@ -226,7 +254,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   res.writeHead(400, CORS);
-  res.end("Usa /start?id=winsport, /start?id=local1 o /start?id=local2");
+  res.end("Usa /play/winsport.m3u8, /play/local1.m3u8 o /play/local2.m3u8");
 });
 
 server.listen(PORT, () => console.log(`Proxy HLS corriendo en puerto ${PORT}`));
