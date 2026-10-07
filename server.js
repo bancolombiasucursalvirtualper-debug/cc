@@ -18,6 +18,8 @@ const CORS = {
 
 const PORT = process.env.PORT || 3000;
 const TMPDIR = os.tmpdir();
+const KEY = process.env.RELAY_KEY || "";
+const UA = "VLC/3.0.20 LibVLC/3.0.20";
 
 // Sesiones activas: id → { dir, ffmpeg, lastAccess }
 const sessions = new Map();
@@ -95,6 +97,44 @@ function waitForFile(filePath, timeout = 15000) {
   });
 }
 
+// Relé genérico: abre cualquier señal http/https (IPs, puertos raros) y la
+// reenvía tal cual, como haría VLC. GET /fetch?u=<url>&k=<RELAY_KEY>
+async function relayFetch(req, res, url) {
+  if (KEY && url.searchParams.get("k") !== KEY) {
+    res.writeHead(403, CORS);
+    res.end("Prohibido");
+    return;
+  }
+  const target = url.searchParams.get("u") || "";
+  if (!/^https?:\/\//i.test(target)) {
+    res.writeHead(400, CORS);
+    res.end("Falta u=");
+    return;
+  }
+  const ac = new AbortController();
+  req.on("close", () => ac.abort());
+  try {
+    const r = await fetch(target, {
+      headers: { "user-agent": UA, accept: "*/*" },
+      redirect: "follow",
+      signal: ac.signal,
+    });
+    res.writeHead(r.status, {
+      ...CORS,
+      "content-type": r.headers.get("content-type") || "application/octet-stream",
+      "x-final-url": r.url,
+    });
+    if (!r.body) { res.end(); return; }
+    for await (const chunk of r.body) {
+      if (!res.write(chunk)) await new Promise((ok) => res.once("drain", ok));
+    }
+    res.end();
+  } catch {
+    if (!res.headersSent) res.writeHead(502, CORS);
+    res.end();
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${PORT}`);
 
@@ -102,6 +142,12 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === "/" || url.pathname === "") {
     res.writeHead(200);
     res.end("Proxy HLS activo ✓");
+    return;
+  }
+
+  // Relé genérico: GET /fetch?u=<url>&k=<RELAY_KEY>
+  if (url.pathname === "/fetch") {
+    await relayFetch(req, res, url);
     return;
   }
 
