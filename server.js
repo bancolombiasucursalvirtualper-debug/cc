@@ -1,6 +1,6 @@
 const http = require("http");
 const { spawn } = require("child_process");
-const { randomUUID } = require("crypto");
+const { randomUUID, timingSafeEqual } = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
@@ -20,6 +20,56 @@ const PORT = process.env.PORT || 3000;
 const TMPDIR = os.tmpdir();
 const KEY = process.env.RELAY_KEY || "";
 const UA = "VLC/3.0.20 LibVLC/3.0.20";
+
+function safeEqual(candidate, expected) {
+  if (typeof candidate !== "string" || !expected) return false;
+  const a = Buffer.from(candidate);
+  const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+// Prefer Authorization: Bearer. Query auth remains temporarily for old app versions.
+function hasRelayAuth(req, url, allowLegacyQuery = false) {
+  if (!KEY) return false;
+  const match = /^Bearer\s+(.+)$/i.exec(req.headers.authorization || "");
+  if (match && safeEqual(match[1], KEY)) return true;
+  return allowLegacyQuery && safeEqual(url.searchParams.get("k") || "", KEY);
+}
+
+function requireRelayAuth(req, res, url, allowLegacyQuery = false) {
+  if (!KEY) {
+    res.writeHead(503, CORS);
+    res.end("Relay sin RELAY_KEY configurada");
+    return false;
+  }
+  if (!hasRelayAuth(req, url, allowLegacyQuery)) {
+    res.writeHead(403, CORS);
+    res.end("Prohibido");
+    return false;
+  }
+  return true;
+}
+
+async function readJsonBody(req, maxBytes = 65536) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > maxBytes) {
+      const error = new Error("Cuerpo demasiado grande");
+      error.statusCode = 413;
+      throw error;
+    }
+    chunks.push(chunk);
+  }
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    const error = new Error("JSON inválido");
+    error.statusCode = 400;
+    throw error;
+  }
+}
 
 // Sesiones activas: sid → { dir, ffmpeg, lastAccess, target }
 const sessions = new Map();
@@ -67,8 +117,11 @@ function spawnFf(sid) {
   ]);
   s.ffmpeg = ff;
   ff.stderr.on("data", d => {
-    s.log = ((s.log || "") + d).slice(-3000);
-    process.stdout.write(`[ffmpeg:${sid.slice(0,6)}] ${d}`);
+    // Do not echo FFmpeg output: upstream URLs may contain private tokens.
+    const message = d.toString().toLowerCase();
+    if (/error|failed|invalid|unable/.test(message)) {
+      s.lastError = "FFmpeg reportó un error; detalle oculto por seguridad";
+    }
   });
   ff.on("error", e => { s.log = "ffmpeg no instalado o falló: " + e.message; console.error(`[ffmpeg error] ${e.message}`); });
   ff.on("close", code => {
@@ -94,7 +147,9 @@ function startSession(target) {
   sessions.set(sid, { dir, target, lastAccess: Date.now(), closed: false });
   byTarget.set(target, sid);
   spawnFf(sid);
-  console.log(`[session] iniciada ${sid} para ${target}`);
+  let host = "origen desconocido";
+  try { host = new URL(target).hostname; } catch {}
+  console.log(`[session] iniciada ${sid} para ${host}`);
   return sid;
 }
 
@@ -117,11 +172,8 @@ function waitForFile(filePath, timeout = 15000) {
 // Relé genérico: abre cualquier señal http/https (IPs, puertos raros) y la
 // reenvía tal cual, como haría VLC. GET /fetch?u=<url>&k=<RELAY_KEY>
 async function relayFetch(req, res, url) {
-  if (KEY && url.searchParams.get("k") !== KEY) {
-    res.writeHead(403, CORS);
-    res.end("Prohibido");
-    return;
-  }
+  // Legacy query authentication remains temporarily for older clients.
+  if (!requireRelayAuth(req, res, url, true)) return;
   const target = url.searchParams.get("u") || "";
   if (!/^https?:\/\//i.test(target)) {
     res.writeHead(400, CORS);
@@ -139,7 +191,6 @@ async function relayFetch(req, res, url) {
     res.writeHead(r.status, {
       ...CORS,
       "content-type": r.headers.get("content-type") || "application/octet-stream",
-      "x-final-url": r.url,
     });
     if (!r.body) { res.end(); return; }
     for await (const chunk of r.body) {
@@ -179,9 +230,14 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Diagnóstico: GET /status
+  // Protected diagnostics: Authorization: Bearer <RELAY_KEY>
   if (url.pathname === "/status") {
-    const out = [...sessions].map(([sid, x]) => ({ sid, target: x.target, restarts: x.restarts || 0, log: x.log || "" }));
+    if (!requireRelayAuth(req, res, url)) return;
+    const out = [...sessions].map(([sid, x]) => {
+      let upstreamHost = "unknown";
+      try { upstreamHost = new URL(x.target).hostname; } catch {}
+      return { sid, upstreamHost, restarts: x.restarts || 0, error: x.lastError || null };
+    });
     res.writeHead(200, { ...CORS, "content-type": "application/json" });
     res.end(JSON.stringify(out, null, 2));
     return;
@@ -193,14 +249,48 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Iniciar sesión: GET /start?id=local1  ó  /start?u=<url>&k=<RELAY_KEY>
+  // Prefer POST /start + Bearer + JSON {"u":"https://..."} for arbitrary sources.
+  // GET /start?id=local1 remains available for preapproved channels.
+  // Legacy GET /start?u=...&k=... remains temporarily compatible.
   if (url.pathname === "/start") {
+    if (req.method === "POST") {
+      if (!requireRelayAuth(req, res, url)) return;
+      let body;
+      try {
+        body = await readJsonBody(req);
+      } catch (error) {
+        res.writeHead(error.statusCode || 400, CORS);
+        res.end(error.statusCode === 413 ? "Cuerpo demasiado grande" : "JSON inválido");
+        return;
+      }
+      const u = body && typeof body.u === "string" ? body.u : "";
+      let parsed;
+      try { parsed = new URL(u); } catch {}
+      if (!parsed || !["http:", "https:"].includes(parsed.protocol)) {
+        res.writeHead(400, CORS);
+        res.end(JSON.stringify({ error: "URL http/https requerida" }));
+        return;
+      }
+      const sid = startSession(parsed.href);
+      res.writeHead(200, { ...CORS, "content-type": "application/json" });
+      res.end(JSON.stringify({ sid, playlist: `/hls/${sid}/live.m3u8` }));
+      return;
+    }
+
+    if (req.method !== "GET") {
+      res.writeHead(405, { ...CORS, allow: "GET, POST" });
+      res.end("Método no permitido");
+      return;
+    }
+
     const id = url.searchParams.get("id");
     let target = id ? ALLOWED[id] : null;
     const u = url.searchParams.get("u");
     if (!target && u) {
-      if (KEY && url.searchParams.get("k") !== KEY) { res.writeHead(403, CORS); res.end("Prohibido"); return; }
-      if (/^https?:\/\//i.test(u)) target = u;
+      if (!requireRelayAuth(req, res, url, true)) return;
+      let parsed;
+      try { parsed = new URL(u); } catch {}
+      if (parsed && ["http:", "https:"].includes(parsed.protocol)) target = parsed.href;
     }
     if (!target) {
       res.writeHead(404, CORS);
@@ -212,7 +302,6 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({ sid, playlist: `/hls/${sid}/live.m3u8` }));
     return;
   }
-
   // Mantener prendido sin reproducir: GET /ping/:sid
   const ping = url.pathname.match(/^\/ping\/([^/]+)$/);
   if (ping) {
