@@ -28,21 +28,20 @@ function safeEqual(candidate, expected) {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
-// Prefer Authorization: Bearer. Query auth remains temporarily for old app versions.
-function hasRelayAuth(req, url, allowLegacyQuery = false) {
+// Protected endpoints require Authorization: Bearer; query-string credentials are rejected.
+function hasRelayAuth(req) {
   if (!KEY) return false;
   const match = /^Bearer\s+(.+)$/i.exec(req.headers.authorization || "");
-  if (match && safeEqual(match[1], KEY)) return true;
-  return allowLegacyQuery && safeEqual(url.searchParams.get("k") || "", KEY);
+  return Boolean(match && safeEqual(match[1], KEY));
 }
 
-function requireRelayAuth(req, res, url, allowLegacyQuery = false) {
+function requireRelayAuth(req, res) {
   if (!KEY) {
     res.writeHead(503, CORS);
     res.end("Relay sin RELAY_KEY configurada");
     return false;
   }
-  if (!hasRelayAuth(req, url, allowLegacyQuery)) {
+  if (!hasRelayAuth(req)) {
     res.writeHead(403, CORS);
     res.end("Prohibido");
     return false;
@@ -170,10 +169,9 @@ function waitForFile(filePath, timeout = 15000) {
 }
 
 // Relé genérico: abre cualquier señal http/https (IPs, puertos raros) y la
-// reenvía tal cual, como haría VLC. GET /fetch?u=<url>&k=<RELAY_KEY>
+// reenvía tal cual, como haría VLC. GET /fetch?u=<url> + Authorization: Bearer <RELAY_KEY>
 async function relayFetch(req, res, url) {
-  // Legacy query authentication remains temporarily for older clients.
-  if (!requireRelayAuth(req, res, url, true)) return;
+  if (!requireRelayAuth(req, res)) return;
   const target = url.searchParams.get("u") || "";
   if (!/^https?:\/\//i.test(target)) {
     res.writeHead(400, CORS);
@@ -232,7 +230,7 @@ const server = http.createServer(async (req, res) => {
 
   // Protected diagnostics: Authorization: Bearer <RELAY_KEY>
   if (url.pathname === "/status") {
-    if (!requireRelayAuth(req, res, url)) return;
+    if (!requireRelayAuth(req, res)) return;
     const out = [...sessions].map(([sid, x]) => {
       let upstreamHost = "unknown";
       try { upstreamHost = new URL(x.target).hostname; } catch {}
@@ -243,7 +241,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Relé genérico: GET /fetch?u=<url>&k=<RELAY_KEY>
+  // Relé genérico: GET /fetch?u=<url> requires Authorization: Bearer
   if (url.pathname === "/fetch") {
     await relayFetch(req, res, url);
     return;
@@ -251,10 +249,9 @@ const server = http.createServer(async (req, res) => {
 
   // Prefer POST /start + Bearer + JSON {"u":"https://..."} for arbitrary sources.
   // GET /start?id=local1 remains available for preapproved channels.
-  // Legacy GET /start?u=...&k=... remains temporarily compatible.
   if (url.pathname === "/start") {
     if (req.method === "POST") {
-      if (!requireRelayAuth(req, res, url)) return;
+      if (!requireRelayAuth(req, res)) return;
       let body;
       try {
         body = await readJsonBody(req);
@@ -287,7 +284,7 @@ const server = http.createServer(async (req, res) => {
     let target = id ? ALLOWED[id] : null;
     const u = url.searchParams.get("u");
     if (!target && u) {
-      if (!requireRelayAuth(req, res, url, true)) return;
+      if (!requireRelayAuth(req, res)) return;
       let parsed;
       try { parsed = new URL(u); } catch {}
       if (parsed && ["http:", "https:"].includes(parsed.protocol)) target = parsed.href;
