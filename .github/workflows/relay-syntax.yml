@@ -15,3 +15,12 @@ jobs:
         with:
           node-version: 20
       - run: node --check server.js
+      - name: Smoke test live relay
+        if: github.ref == 'refs/heads/security/relay-auth-header'
+        shell: bash
+        run: |
+          set -euo pipefail
+          health_code="$(curl -sS -o /tmp/relay-health.txt -w '%{http_code}' https://cc-production-0fde.up.railway.app/)"
+          test "$health_code" = "200"
+          status_code="$(curl -sS -o /tmp/relay-status.txt -w '%{http_code}' https://cc-production-0fde.up.railway.app/status)"
+          test "$status_code" = "403"
