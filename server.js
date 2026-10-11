@@ -19,6 +19,7 @@ const CORS = {
 const PORT = process.env.PORT || 3000;
 const TMPDIR = os.tmpdir();
 const KEY = process.env.RELAY_KEY || "";
+const PREVIOUS_KEY = process.env.RELAY_KEY_PREVIOUS || "";
 const UA = "VLC/3.0.20 LibVLC/3.0.20";
 
 function safeEqual(candidate, expected) {
@@ -30,13 +31,14 @@ function safeEqual(candidate, expected) {
 
 // Protected endpoints require Authorization: Bearer; query-string credentials are rejected.
 function hasRelayAuth(req) {
-  if (!KEY) return false;
+  const keys = [KEY, PREVIOUS_KEY].filter(Boolean);
+  if (!keys.length) return false;
   const match = /^Bearer\s+(.+)$/i.exec(req.headers.authorization || "");
-  return Boolean(match && safeEqual(match[1], KEY));
+  return Boolean(match && keys.some((key) => safeEqual(match[1], key)));
 }
 
 function requireRelayAuth(req, res) {
-  if (!KEY) {
+  if (!KEY && !PREVIOUS_KEY) {
     res.writeHead(503, CORS);
     res.end("Relay sin RELAY_KEY configurada");
     return false;
