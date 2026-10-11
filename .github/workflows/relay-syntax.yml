@@ -30,7 +30,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          play_code="$(curl -sS --max-time 45 -o /tmp/colombia-play.json -w '%{http_code}' 'https://youtube-com-co.lovable.app/api/public/colombia/play?id=0')"
+          play_code="$(curl -sS --max-time 45 -o /tmp/colombia-play.json -w '%{http_code}' 'https://youtube-com-co.lovable.app/api/public/colombia/play?id=25')"
           if [ "$play_code" != "200" ]; then
             echo "Colombia play API returned HTTP $play_code"
             node -e 'const d=require("/tmp/colombia-play.json"); console.log("API error:", d.error || "unspecified")'
