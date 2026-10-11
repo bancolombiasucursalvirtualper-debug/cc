@@ -60,4 +60,4 @@ jobs:
             echo "HLS segment check failed (HTTP $segment_code)"
             exit 1
           fi
-          echo "End-to-end playback passed: play API, HLS playlist, and media segment returned successfully."
+          echo "End-to-end playback passed: published play API, HLS playlist, and media segment returned successfully."
