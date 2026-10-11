@@ -214,6 +214,7 @@ const server = http.createServer(async (req, res) => {
   // Para VLC: GET /play/local1.m3u8 -> arranca el canal y entrega la lista directa
   const play = url.pathname.match(/^\/play\/([a-z0-9]+)(\.m3u8)?$/i);
   if (play) {
+    if (!requireRelayAuth(req, res)) return;
     const target = ALLOWED[play[1]];
     if (!target) { res.writeHead(404, CORS); res.end("Canal no encontrado"); return; }
     const sid = startSession(target);
@@ -250,8 +251,8 @@ const server = http.createServer(async (req, res) => {
   // Prefer POST /start + Bearer + JSON {"u":"https://..."} for arbitrary sources.
   // GET /start?id=local1 remains available for preapproved channels.
   if (url.pathname === "/start") {
+    if (!requireRelayAuth(req, res)) return;
     if (req.method === "POST") {
-      if (!requireRelayAuth(req, res)) return;
       let body;
       try {
         body = await readJsonBody(req);
@@ -284,7 +285,6 @@ const server = http.createServer(async (req, res) => {
     let target = id ? ALLOWED[id] : null;
     const u = url.searchParams.get("u");
     if (!target && u) {
-      if (!requireRelayAuth(req, res)) return;
       let parsed;
       try { parsed = new URL(u); } catch {}
       if (parsed && ["http:", "https:"].includes(parsed.protocol)) target = parsed.href;
@@ -302,6 +302,7 @@ const server = http.createServer(async (req, res) => {
   // Mantener prendido sin reproducir: GET /ping/:sid
   const ping = url.pathname.match(/^\/ping\/([^/]+)$/);
   if (ping) {
+    if (!requireRelayAuth(req, res)) return;
     const s = sessions.get(ping[1]);
     if (s) s.lastAccess = Date.now();
     res.writeHead(s ? 204 : 404, CORS); res.end(); return;
