@@ -1,0 +1,62 @@
+name: Post-deploy relay smoke test
+on:
+  push:
+    branches: [verification/post-deploy-smoke]
+permissions:
+  contents: read
+jobs:
+  post-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Check relay auth behavior
+        shell: bash
+        run: |
+          set -euo pipefail
+          health_code="$(curl -sS --max-time 15 -o /dev/null -w '%{http_code}' https://cc-production-0fde.up.railway.app/)"
+          status_code="$(curl -sS --max-time 15 -o /dev/null -w '%{http_code}' https://cc-production-0fde.up.railway.app/status)"
+          query_start_code="$(curl -sS --max-time 15 -o /dev/null -w '%{http_code}' 'https://cc-production-0fde.up.railway.app/start?u=https%3A%2F%2Fexample.com%2Ftest.m3u8&k=not-a-key')"
+          query_fetch_code="$(curl -sS --max-time 15 -o /dev/null -w '%{http_code}' 'https://cc-production-0fde.up.railway.app/fetch?u=https%3A%2F%2Fexample.com%2F&k=not-a-key')"
+          unauth_post_code="$(curl -sS --max-time 15 -o /dev/null -w '%{http_code}' -X POST -H 'content-type: application/json' -d '{}' https://cc-production-0fde.up.railway.app/start)"
+          test "$health_code" = "200"
+          test "$status_code" = "403"
+          test "$query_start_code" = "403"
+          test "$query_fetch_code" = "403"
+          test "$unauth_post_code" = "403"
+          echo "Relay live checks passed: health is up; status, query-auth, and unauthenticated POST are denied."
+
+      - name: Verify published MiTube HLS playback
+        shell: bash
+        run: |
+          set -euo pipefail
+          play_code="$(curl -sS --max-time 45 -o /tmp/colombia-play.json -w '%{http_code}' 'https://youtube-com-co.lovable.app/api/public/colombia/play?id=25')"
+          if [ "$play_code" != "200" ]; then
+            echo "Colombia play API returned HTTP $play_code"
+            node -e 'const d=require("/tmp/colombia-play.json"); console.log("API error:", d.error || "unspecified")'
+            exit 1
+          fi
+          playlist="$(node -e 'const d=require("/tmp/colombia-play.json"); if (typeof d.playlist !== "string") process.exit(1); console.log(d.playlist)')"
+          case "$playlist" in
+            https://cc-production-0fde.up.railway.app/hls/*/live.m3u8) ;;
+            *) echo "Play API returned an unexpected playlist URL"; exit 1 ;;
+          esac
+          playlist_code="$(curl -sS --max-time 25 -o /tmp/colombia-playlist.m3u8 -w '%{http_code}' "$playlist")"
+          if [ "$playlist_code" != "200" ] || ! grep -q '^#EXTM3U' /tmp/colombia-playlist.m3u8; then
+            echo "HLS playlist check failed (HTTP $playlist_code)"
+            exit 1
+          fi
+          segment="$(awk '!/^#/ && NF { print; exit }' /tmp/colombia-playlist.m3u8)"
+          if [ -z "$segment" ]; then
+            echo "HLS playlist had no media segment"
+            exit 1
+          fi
+          segment_url="$(node -e 'console.log(new URL(process.argv[1], process.argv[2]).href)' "$segment" "$playlist")"
+          segment_code="$(curl -sS --max-time 25 -o /tmp/colombia-segment.ts -w '%{http_code}' "$segment_url")"
+          if [ "$segment_code" != "200" ] || [ ! -s /tmp/colombia-segment.ts ]; then
+            echo "HLS segment check failed (HTTP $segment_code)"
+            exit 1
+          fi
+          echo "Published playback passed: API, playlist, and media segment all returned successfully."
