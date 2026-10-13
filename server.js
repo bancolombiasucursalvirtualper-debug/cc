@@ -179,12 +179,12 @@ function waitForPlaylist(filePath, timeout = 30000) {
       try {
         if (fs.existsSync(filePath)) {
           const manifest = fs.readFileSync(filePath, "utf8");
-          const lines = manifest.split(/\\r?\\n/).map((line) => line.trim());
+          const lines = manifest.split(/\r?\n/).map((line) => line.trim());
           const hasHeader = lines[0] === "#EXTM3U";
           const hasSegments = lines.some((line) => line.startsWith("#EXTINF:"));
           const segmentNames = lines.filter((line) => line && !line.startsWith("#"));
           const hasWrittenSegment = segmentNames.some((name) => {
-            if (name.includes("/") || name.includes("\\\\") || name === "." || name === "..") return false;
+            if (name.includes("/") || name.includes("\\") || name === "." || name === "..") return false;
             const segmentPath = path.resolve(dir, name);
             if (!segmentPath.startsWith(path.resolve(dir) + path.sep)) return false;
             try { return fs.statSync(segmentPath).isFile() && fs.statSync(segmentPath).size > 0; }
