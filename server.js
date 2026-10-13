@@ -158,13 +158,43 @@ function waitForFile(filePath, timeout = 15000) {
   return new Promise((resolve, reject) => {
     const start = Date.now();
     const check = () => {
-      if (fs.existsSync(filePath) && fs.statSync(filePath).size > 0) {
-        resolve();
-      } else if (Date.now() - start > timeout) {
-        reject(new Error("timeout esperando archivo"));
-      } else {
-        setTimeout(check, 300);
-      }
+      try {
+        if (fs.existsSync(filePath) && fs.statSync(filePath).size > 0) return resolve();
+      } catch {}
+      if (Date.now() - start > timeout) return reject(new Error("timeout esperando archivo"));
+      setTimeout(check, 300);
+    };
+    check();
+  });
+}
+
+// No anunciar HLS listo solo porque FFmpeg creó el archivo: puede estar vacío,
+// truncado o todavía no tener segmentos. Esperar una lista completa y al menos
+// un segmento real evita devolver manifiestos que el reproductor no puede usar.
+function waitForPlaylist(filePath, timeout = 30000) {
+  return new Promise((resolve, reject) => {
+    const start = Date.now();
+    const dir = path.dirname(filePath);
+    const check = () => {
+      try {
+        if (fs.existsSync(filePath)) {
+          const manifest = fs.readFileSync(filePath, "utf8");
+          const lines = manifest.split(/\\r?\\n/).map((line) => line.trim());
+          const hasHeader = lines[0] === "#EXTM3U";
+          const hasSegments = lines.some((line) => line.startsWith("#EXTINF:"));
+          const segmentNames = lines.filter((line) => line && !line.startsWith("#"));
+          const hasWrittenSegment = segmentNames.some((name) => {
+            if (name.includes("/") || name.includes("\\\\") || name === "." || name === "..") return false;
+            const segmentPath = path.resolve(dir, name);
+            if (!segmentPath.startsWith(path.resolve(dir) + path.sep)) return false;
+            try { return fs.statSync(segmentPath).isFile() && fs.statSync(segmentPath).size > 0; }
+            catch { return false; }
+          });
+          if (hasHeader && hasSegments && segmentNames.length > 0 && hasWrittenSegment) return resolve();
+        }
+      } catch {}
+      if (Date.now() - start > timeout) return reject(new Error("timeout esperando lista HLS válida y segmento"));
+      setTimeout(check, 350);
     };
     check();
   });
@@ -221,7 +251,7 @@ const server = http.createServer(async (req, res) => {
     if (!target) { res.writeHead(404, CORS); res.end("Canal no encontrado"); return; }
     const sid = startSession(target);
     try {
-      await waitForFile(path.join(sessions.get(sid).dir, "live.m3u8"), 25000);
+      await waitForPlaylist(path.join(sessions.get(sid).dir, "live.m3u8"), 35000);
       res.writeHead(302, { ...CORS, location: `/hls/${sid}/live.m3u8` });
       res.end();
     } catch {
@@ -272,6 +302,19 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const sid = startSession(parsed.href);
+      const session = sessions.get(sid);
+      if (!session) {
+        res.writeHead(502, { ...CORS, "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "No se pudo crear la sesión HLS" }));
+        return;
+      }
+      try {
+        await waitForPlaylist(path.join(session.dir, "live.m3u8"), 35000);
+      } catch {
+        res.writeHead(502, { ...CORS, "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "La fuente no entregó una lista HLS con segmentos reproducibles" }));
+        return;
+      }
       res.writeHead(200, { ...CORS, "content-type": "application/json" });
       res.end(JSON.stringify({ sid, playlist: `/hls/${sid}/live.m3u8` }));
       return;
@@ -328,7 +371,8 @@ const server = http.createServer(async (req, res) => {
     const filePath = path.join(s.dir, file);
 
     try {
-      await waitForFile(filePath, 15000);
+      if (file.endsWith(".m3u8")) await waitForPlaylist(filePath, 20000);
+      else await waitForFile(filePath, 15000);
       const data = fs.readFileSync(filePath);
       const ct = file.endsWith(".m3u8")
         ? "application/vnd.apple.mpegurl"
