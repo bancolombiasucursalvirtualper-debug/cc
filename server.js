@@ -311,6 +311,8 @@ function spawnFf(sid) {
     "-reconnect", "1", "-reconnect_streamed", "1",
     "-reconnect_delay_max", "5",
     "-fflags", "+genpts+discardcorrupt",
+    "-http_proxy", OUTBOUND_PROXY_URL,
+    "-protocol_whitelist", "http,https,tcp,tls,crypto,data",
     "-i", s.target,
     "-map", "0:v:0?", "-map", "0:a:0?",
     "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
@@ -624,4 +626,13 @@ const server = http.createServer(async (req, res) => {
   res.end("Usa /play/winsport.m3u8, /play/local1.m3u8 o /play/local2.m3u8");
 });
 
-server.listen(PORT, () => console.log(`Proxy HLS corriendo en puerto ${PORT}`));
+outboundProxyServer.listen(0, "127.0.0.1", () => {
+  const address = outboundProxyServer.address();
+  if (!address || typeof address === "string") {
+    console.error("No se pudo iniciar el proxy de salida");
+    process.exit(1);
+    return;
+  }
+  OUTBOUND_PROXY_URL = `http://${OUTBOUND_PROXY_USER}:${OUTBOUND_PROXY_PASSWORD}@127.0.0.1:${address.port}`;
+  server.listen(PORT, () => console.log(`Proxy HLS corriendo en puerto ${PORT}`));
+});
