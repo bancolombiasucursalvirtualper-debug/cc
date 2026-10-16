@@ -227,6 +227,9 @@ const outboundProxyServer = http.createServer(async (req, res) => {
       : new URL(raw, `http://${req.headers.host || ""}`);
   } catch { res.writeHead(400, { connection: "close" }); res.end(); return; }
   if (target.protocol !== "http:") { res.writeHead(400, { connection: "close" }); res.end(); return; }
+  const controller = new AbortController();
+  req.on("aborted", () => controller.abort());
+  res.on("close", () => { if (!res.writableEnded) controller.abort(); });
   try {
     const cleanHeaders = {};
     for (const [name, value] of Object.entries(req.headers)) {
@@ -234,7 +237,7 @@ const outboundProxyServer = http.createServer(async (req, res) => {
       cleanHeaders[name] = value;
     }
     cleanHeaders.host = target.host;
-    const pinned = await pinnedHttpFetch(target.href, { method: req.method, headers: cleanHeaders });
+    const pinned = await pinnedHttpFetch(target.href, { method: req.method, headers: cleanHeaders, signal: controller.signal });
     res.writeHead(pinned.response.status, Object.fromEntries(pinned.response.headers.entries()));
     if (!pinned.response.body) { res.end(); return; }
     for await (const chunk of pinned.response.body) {
