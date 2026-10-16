@@ -38,6 +38,9 @@ jobs:
           old_fetch_code="$(curl -sS -o /dev/null -w '%{http_code}' 'http://127.0.0.1:18765/fetch?u=https%3A%2F%2Fexample.com%2F&k=ci-test-secret')"
           unauth_post_code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H 'content-type: application/json' -d '{}' http://127.0.0.1:18765/start)"
           bearer_post_code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H 'Authorization: Bearer ci-test-secret' -H 'content-type: application/json' -d '{}' http://127.0.0.1:18765/start)"
+          private_ip_start_code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H 'Authorization: Bearer ci-test-secret' -H 'content-type: application/json' -d '{\"u\":\"http://127.0.0.1:18765/\"}' http://127.0.0.1:18765/start)"
+          private_ipv6_start_code="$(curl -g -sS -o /dev/null -w '%{http_code}' -X POST -H 'Authorization: Bearer ci-test-secret' -H 'content-type: application/json' -d '{\"u\":\"http://[::1]:18765/\"}' http://127.0.0.1:18765/start)"
+          localhost_start_code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H 'Authorization: Bearer ci-test-secret' -H 'content-type: application/json' -d '{\"u\":\"http://localhost:18765/\"}' http://127.0.0.1:18765/start)"
 
           test "$health_code" = "200"
           test "$status_code" = "403"
@@ -48,7 +51,10 @@ jobs:
           test "$old_fetch_code" = "403"
           test "$unauth_post_code" = "403"
           test "$bearer_post_code" = "400"
-          echo "Local auth checks passed: legacy routes, query-key auth, and unauthenticated requests rejected."
+          test "$private_ip_start_code" = "400"
+          test "$private_ipv6_start_code" = "400"
+          test "$localhost_start_code" = "400"
+          echo "Local auth and SSRF checks passed: unauthenticated requests and local/private source URLs rejected."
 
       - name: Smoke test live relay and published Colombia playback
         if: github.ref == 'refs/heads/security/remove-query-key-auth'

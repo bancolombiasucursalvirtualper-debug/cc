@@ -1,9 +1,13 @@
-const http = require("http");
+const http = require("node:http");
+const https = require("node:https");
+const { Readable } = require("node:stream");
 const { spawn } = require("child_process");
-const { randomUUID, timingSafeEqual } = require("crypto");
+const { randomBytes, randomUUID, timingSafeEqual } = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const dns = require("node:dns/promises");
+const net = require("node:net");
 
 const ALLOWED = {
   winsport: "http://138.121.15.230:9002/WIN-SPORT/index.m3u8",
@@ -72,6 +76,212 @@ async function readJsonBody(req, maxBytes = 65536) {
   }
 }
 
+function ipv4IsPublic(address) {
+  const parts = address.split(".").map(Number);
+  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return false;
+  const [a, b, c] = parts;
+  return !(a === 0 || a === 10 || a === 127 || a >= 224 ||
+    (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) || (a === 192 && (b === 0 || b === 168)) ||
+    (a === 192 && b === 88 && c === 99) ||
+    (a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100))) ||
+    (a === 203 && b === 0 && c === 113));
+}
+
+function ipv6ToBigInt(address) {
+  let normalized = address.toLowerCase().split("%")[0] || "";
+  if (normalized.includes(".")) {
+    const lastColon = normalized.lastIndexOf(":");
+    const ipv4 = normalized.slice(lastColon + 1).split(".").map(Number);
+    if (ipv4.length !== 4 || ipv4.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return null;
+    const high = ((ipv4[0] << 8) | ipv4[1]).toString(16);
+    const low = ((ipv4[2] << 8) | ipv4[3]).toString(16);
+    normalized = normalized.slice(0, lastColon + 1) + high + ":" + low;
+  }
+  const sections = normalized.split("::");
+  if (sections.length > 2) return null;
+  const left = sections[0] ? sections[0].split(":").filter(Boolean) : [];
+  const right = sections.length === 2 && sections[1] ? sections[1].split(":").filter(Boolean) : [];
+  const missing = 8 - left.length - right.length;
+  if (missing < 0 || (sections.length === 1 && missing !== 0)) return null;
+  const words = [...left, ...Array(missing).fill("0"), ...right];
+  if (words.length !== 8 || words.some((word) => !/^[0-9a-f]{1,4}$/.test(word))) return null;
+  return words.reduce((value, word) => (value << 16n) | BigInt(parseInt(word, 16)), 0n);
+}
+
+function isPublicAddress(address, family = net.isIP(address)) {
+  if (family === 4) return ipv4IsPublic(address);
+  if (family !== 6) return false;
+  const value = ipv6ToBigInt(address);
+  if (value === null || ((value >> 125n) & 0x7n) !== 0x1n) return false;
+  if ((value >> 96n) === 0x20010db8n) return false;
+  if ((value >> 80n) === 0x200100020000n) return false;
+  return true;
+}
+
+async function resolvePublicTarget(value) {
+  let parsed;
+  try { parsed = new URL(value); } catch { throw new Error("URL de origen inválida"); }
+  if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password) throw new Error("URL de origen no permitida");
+  const hostname = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (!hostname || hostname === "localhost" || hostname.endsWith(".localhost") || hostname.endsWith(".local") || hostname.endsWith(".internal")) throw new Error("Host local no permitido");
+  const family = net.isIP(hostname);
+  const records = family ? [{ address: hostname, family }] : await dns.lookup(hostname, { all: true, verbatim: true });
+  if (!records.length || records.some((record) => !isPublicAddress(record.address, record.family))) throw new Error("El host de origen resuelve a una dirección no pública");
+  const address = records.find((record) => record.family === 4) || records[0];
+  return { url: parsed, address };
+}
+
+async function validatePublicTarget(value) {
+  const resolved = await resolvePublicTarget(value);
+  return resolved.url.href;
+}
+function pinnedLookupFor(address) {
+  return (_hostname, options, callback) => {
+    if (typeof options === "function") { callback = options; options = {}; }
+    if (options && options.all) callback(null, [{ address: address.address, family: address.family }]);
+    else callback(null, address.address, address.family);
+  };
+}
+
+function forwardedHeaders(source) {
+  const result = new Headers();
+  const hopByHop = new Set(["connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade"]);
+  for (const [name, raw] of Object.entries(source)) {
+    if (raw === undefined || hopByHop.has(name.toLowerCase())) continue;
+    if (Array.isArray(raw)) {
+      if (name.toLowerCase() === "set-cookie") raw.forEach((value) => result.append(name, value));
+      else result.set(name, raw.join(", "));
+    } else result.set(name, String(raw));
+  }
+  return result;
+}
+
+// One upstream HTTP(S) request. DNS is resolved/checked here and the socket uses exactly that answer.
+async function pinnedHttpFetch(value, init = {}) {
+  const resolved = await resolvePublicTarget(value);
+  const target = resolved.url;
+  const address = resolved.address;
+  const method = init.method || "GET";
+  if (method !== "GET" && method !== "HEAD") throw new Error("Método de salida no permitido");
+  const client = target.protocol === "https:" ? https : http;
+  const headers = {};
+  new Headers(init.headers).forEach((headerValue, name) => { headers[name] = headerValue; });
+  delete headers["proxy-authorization"];
+  delete headers["proxy-connection"];
+  if (!headers.host) headers.host = target.host;
+  return new Promise((resolve, reject) => {
+    const request = client.request({
+      protocol: target.protocol,
+      hostname: target.hostname.startsWith("[") && target.hostname.endsWith("]") ? target.hostname.slice(1, -1) : target.hostname,
+      port: target.port ? Number(target.port) : undefined,
+      method,
+      path: target.pathname + target.search,
+      headers,
+      agent: false,
+      lookup: pinnedLookupFor(address),
+      signal: init.signal || undefined,
+    }, (upstream) => {
+      const status = upstream.statusCode || 502;
+      if (status < 200) { upstream.destroy(); reject(new Error("Respuesta de origen no válida")); return; }
+      const body = method === "HEAD" || [204, 205, 304].includes(status) ? null : Readable.toWeb(upstream);
+      resolve({
+        response: new Response(body, { status, statusText: upstream.statusMessage, headers: forwardedHeaders(upstream.headers) }),
+        finalUrl: target.href,
+      });
+    });
+    request.on("error", reject);
+    request.setTimeout(20000, () => request.destroy(new Error("Tiempo de espera de origen agotado")));
+    request.end();
+  });
+}
+
+const OUTBOUND_PROXY_USER = "mitube-relay";
+const OUTBOUND_PROXY_PASSWORD = randomBytes(32).toString("hex");
+let OUTBOUND_PROXY_URL = "";
+function expectedProxyAuthorization() {
+  return "Basic " + Buffer.from(`${OUTBOUND_PROXY_USER}:${OUTBOUND_PROXY_PASSWORD}`).toString("base64");
+}
+function hasOutboundProxyAuth(req) {
+  return safeEqual(req.headers["proxy-authorization"], expectedProxyAuthorization());
+}
+function writeConnectError(socket, status, reason) {
+  if (socket.destroyed) return;
+  socket.end(`HTTP/1.1 ${status} ${reason}\r\nConnection: close\r\n\r\n`);
+}
+
+// Loopback-only authenticated proxy used by FFmpeg. HTTP requests and HTTPS CONNECT tunnels
+// resolve and validate every destination; HTTPS TLS/SNI remains end-to-end inside the tunnel.
+const outboundProxyServer = http.createServer(async (req, res) => {
+  if (!hasOutboundProxyAuth(req)) {
+    res.writeHead(407, { "proxy-authenticate": 'Basic realm="MiTube relay"', connection: "close" });
+    res.end();
+    return;
+  }
+  if (req.method !== "GET" && req.method !== "HEAD") { res.writeHead(405, { connection: "close" }); res.end(); return; }
+  let target;
+  try {
+    const raw = req.url || "/";
+    target = raw.startsWith("http://") || raw.startsWith("https://")
+      ? new URL(raw)
+      : new URL(raw, `http://${req.headers.host || ""}`);
+  } catch { res.writeHead(400, { connection: "close" }); res.end(); return; }
+  if (target.protocol !== "http:") { res.writeHead(400, { connection: "close" }); res.end(); return; }
+  const controller = new AbortController();
+  req.on("aborted", () => controller.abort());
+  res.on("close", () => { if (!res.writableEnded) controller.abort(); });
+  try {
+    const cleanHeaders = {};
+    for (const [name, value] of Object.entries(req.headers)) {
+      if (["proxy-authorization", "proxy-connection", "connection", "keep-alive", "transfer-encoding", "upgrade", "te", "trailer"].includes(name.toLowerCase()) || value === undefined) continue;
+      cleanHeaders[name] = value;
+    }
+    cleanHeaders.host = target.host;
+    const pinned = await pinnedHttpFetch(target.href, { method: req.method, headers: cleanHeaders, signal: controller.signal });
+    res.writeHead(pinned.response.status, Object.fromEntries(pinned.response.headers.entries()));
+    if (!pinned.response.body) { res.end(); return; }
+    for await (const chunk of pinned.response.body) {
+      if (!res.write(Buffer.from(chunk))) await new Promise((resolve) => res.once("drain", resolve));
+    }
+    res.end();
+  } catch {
+    if (!res.headersSent) res.writeHead(502, { connection: "close" });
+    res.end();
+  }
+});
+
+outboundProxyServer.on("connect", async (req, clientSocket, head) => {
+  if (!hasOutboundProxyAuth(req)) { writeConnectError(clientSocket, 407, "Proxy Authentication Required"); return; }
+  let target;
+  try { target = new URL(`https://${req.url || ""}`); }
+  catch { writeConnectError(clientSocket, 400, "Bad Request"); return; }
+  if (target.pathname !== "/" || target.search || target.hash || target.username || target.password) { writeConnectError(clientSocket, 400, "Bad Request"); return; }
+  const port = target.port ? Number(target.port) : 443;
+  if (!Number.isInteger(port) || port < 1 || port > 65535) { writeConnectError(clientSocket, 400, "Bad Request"); return; }
+  try {
+    const resolved = await resolvePublicTarget(target.href);
+    const upstream = net.connect({ host: resolved.address.address, port, family: resolved.address.family });
+    let connected = false;
+    const timer = setTimeout(() => upstream.destroy(new Error("Tiempo de espera de origen agotado")), 15000);
+    upstream.once("connect", () => {
+      connected = true;
+      clearTimeout(timer);
+      clientSocket.write("HTTP/1.1 200 Connection Established\r\nProxy-Agent: MiTube-Relay\r\n\r\n");
+      if (head && head.length) upstream.write(head);
+      clientSocket.pipe(upstream);
+      upstream.pipe(clientSocket);
+    });
+    upstream.on("error", () => {
+      clearTimeout(timer);
+      if (!connected) writeConnectError(clientSocket, 502, "Bad Gateway");
+      clientSocket.destroy();
+    });
+    clientSocket.on("error", () => upstream.destroy());
+    clientSocket.on("close", () => upstream.destroy());
+  } catch { writeConnectError(clientSocket, 403, "Forbidden"); }
+});
+outboundProxyServer.on("clientError", (_error, socket) => writeConnectError(socket, 400, "Bad Request"));
+
 // Sesiones activas: sid → { dir, ffmpeg, lastAccess, target }
 const sessions = new Map();
 const byTarget = new Map(); // url → sid (un solo ffmpeg por canal, lo comparten todos)
@@ -105,6 +315,8 @@ function spawnFf(sid) {
     "-reconnect", "1", "-reconnect_streamed", "1",
     "-reconnect_delay_max", "5",
     "-fflags", "+genpts+discardcorrupt",
+    "-http_proxy", OUTBOUND_PROXY_URL,
+    "-protocol_whitelist", "http,https,tcp,tls,crypto,data",
     "-i", s.target,
     "-map", "0:v:0?", "-map", "0:a:0?",
     "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
@@ -211,13 +423,33 @@ async function relayFetch(req, res, url) {
     return;
   }
   const ac = new AbortController();
-  req.on("close", () => ac.abort());
+  req.on("aborted", () => ac.abort());
+  res.on("close", () => { if (!res.writableEnded) ac.abort(); });
   try {
-    const r = await fetch(target, {
-      headers: { "user-agent": UA, accept: "*/*" },
-      redirect: "follow",
-      signal: ac.signal,
-    });
+    let current = target;
+    let r = null;
+    for (let redirects = 0; redirects <= 4; redirects++) {
+      const fetched = await pinnedHttpFetch(current, {
+        headers: { "user-agent": UA, accept: "*/*" },
+        signal: ac.signal,
+      });
+      r = fetched.response;
+      current = fetched.finalUrl;
+      if (r.status < 300 || r.status >= 400) break;
+      const location = r.headers.get("location");
+      if (!location || redirects === 4) {
+        try { await r.body?.cancel(); } catch {}
+        throw new Error("Redirección de origen no válida");
+      }
+      const next = new URL(location, current);
+      if (new URL(current).protocol === "https:" && next.protocol !== "https:") {
+        try { await r.body?.cancel(); } catch {}
+        throw new Error("Redirección HTTPS a HTTP bloqueada");
+      }
+      try { await r.body?.cancel(); } catch {}
+      current = next.href;
+    }
+    if (!r) throw new Error("No hubo respuesta del origen");
     res.writeHead(r.status, {
       ...CORS,
       "content-type": r.headers.get("content-type") || "application/octet-stream",
@@ -249,7 +481,10 @@ const server = http.createServer(async (req, res) => {
     if (!requireRelayAuth(req, res)) return;
     const target = ALLOWED[play[1]];
     if (!target) { res.writeHead(404, CORS); res.end("Canal no encontrado"); return; }
-    const sid = startSession(target);
+    let safeTarget;
+    try { safeTarget = await validatePublicTarget(target); }
+    catch { res.writeHead(400, CORS); res.end("Destino de origen no permitido"); return; }
+    const sid = startSession(safeTarget);
     try {
       await waitForPlaylist(path.join(sessions.get(sid).dir, "live.m3u8"), 35000);
       res.writeHead(302, { ...CORS, location: `/hls/${sid}/live.m3u8` });
@@ -301,7 +536,10 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ error: "URL http/https requerida" }));
         return;
       }
-      const sid = startSession(parsed.href);
+      let safeTarget;
+      try { safeTarget = await validatePublicTarget(parsed.href); }
+      catch { res.writeHead(400, { ...CORS, "content-type": "application/json" }); res.end(JSON.stringify({ error: "Destino de origen no permitido" })); return; }
+      const sid = startSession(safeTarget);
       const session = sessions.get(sid);
       if (!session) {
         res.writeHead(502, { ...CORS, "content-type": "application/json" });
@@ -339,7 +577,10 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: "Canal no encontrado" }));
       return;
     }
-    const sid = startSession(target);
+    let safeTarget;
+    try { safeTarget = await validatePublicTarget(target); }
+    catch { res.writeHead(400, { ...CORS, "content-type": "application/json" }); res.end(JSON.stringify({ error: "Destino de origen no permitido" })); return; }
+    const sid = startSession(safeTarget);
     res.writeHead(200, { ...CORS, "content-type": "application/json" });
     res.end(JSON.stringify({ sid, playlist: `/hls/${sid}/live.m3u8` }));
     return;
@@ -390,4 +631,13 @@ const server = http.createServer(async (req, res) => {
   res.end("Usa /play/winsport.m3u8, /play/local1.m3u8 o /play/local2.m3u8");
 });
 
-server.listen(PORT, () => console.log(`Proxy HLS corriendo en puerto ${PORT}`));
+outboundProxyServer.listen(0, "127.0.0.1", () => {
+  const address = outboundProxyServer.address();
+  if (!address || typeof address === "string") {
+    console.error("No se pudo iniciar el proxy de salida");
+    process.exit(1);
+    return;
+  }
+  OUTBOUND_PROXY_URL = `http://${OUTBOUND_PROXY_USER}:${OUTBOUND_PROXY_PASSWORD}@127.0.0.1:${address.port}`;
+  server.listen(PORT, () => console.log(`Proxy HLS corriendo en puerto ${PORT}`));
+});
