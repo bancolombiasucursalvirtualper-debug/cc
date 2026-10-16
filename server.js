@@ -4,6 +4,8 @@ const { randomUUID, timingSafeEqual } = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const dns = require("node:dns/promises");
+const net = require("node:net");
 
 const ALLOWED = {
   winsport: "http://138.121.15.230:9002/WIN-SPORT/index.m3u8",
@@ -72,6 +74,60 @@ async function readJsonBody(req, maxBytes = 65536) {
   }
 }
 
+function ipv4IsPublic(address) {
+  const parts = address.split(".").map(Number);
+  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return false;
+  const [a, b, c] = parts;
+  return !(a === 0 || a === 10 || a === 127 || a >= 224 ||
+    (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) || (a === 192 && (b === 0 || b === 168)) ||
+    (a === 192 && b === 88 && c === 99) ||
+    (a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100))) ||
+    (a === 203 && b === 0 && c === 113));
+}
+
+function ipv6ToBigInt(address) {
+  let normalized = address.toLowerCase().split("%")[0] || "";
+  if (normalized.includes(".")) {
+    const lastColon = normalized.lastIndexOf(":");
+    const ipv4 = normalized.slice(lastColon + 1).split(".").map(Number);
+    if (ipv4.length !== 4 || ipv4.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return null;
+    const high = ((ipv4[0] << 8) | ipv4[1]).toString(16);
+    const low = ((ipv4[2] << 8) | ipv4[3]).toString(16);
+    normalized = normalized.slice(0, lastColon + 1) + high + ":" + low;
+  }
+  const sections = normalized.split("::");
+  if (sections.length > 2) return null;
+  const left = sections[0] ? sections[0].split(":").filter(Boolean) : [];
+  const right = sections.length === 2 && sections[1] ? sections[1].split(":").filter(Boolean) : [];
+  const missing = 8 - left.length - right.length;
+  if (missing < 0 || (sections.length === 1 && missing !== 0)) return null;
+  const words = [...left, ...Array(missing).fill("0"), ...right];
+  if (words.length !== 8 || words.some((word) => !/^[0-9a-f]{1,4}$/.test(word))) return null;
+  return words.reduce((value, word) => (value << 16n) | BigInt(parseInt(word, 16)), 0n);
+}
+
+function isPublicAddress(address, family = net.isIP(address)) {
+  if (family === 4) return ipv4IsPublic(address);
+  if (family !== 6) return false;
+  const value = ipv6ToBigInt(address);
+  if (value === null || ((value >> 125n) & 0x7n) !== 0x1n) return false;
+  if ((value >> 96n) === 0x20010db8n) return false;
+  if ((value >> 80n) === 0x200100020000n) return false;
+  return true;
+}
+
+async function validatePublicTarget(value) {
+  let parsed;
+  try { parsed = new URL(value); } catch { throw new Error("URL de origen inválida"); }
+  if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password) throw new Error("URL de origen no permitida");
+  const hostname = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (!hostname || hostname === "localhost" || hostname.endsWith(".localhost") || hostname.endsWith(".local") || hostname.endsWith(".internal")) throw new Error("Host local no permitido");
+  const family = net.isIP(hostname);
+  const records = family ? [{ address: hostname, family }] : await dns.lookup(hostname, { all: true, verbatim: true });
+  if (!records.length || records.some((record) => !isPublicAddress(record.address, record.family))) throw new Error("El host de origen resuelve a una dirección no pública");
+  return parsed.href;
+}
 // Sesiones activas: sid → { dir, ffmpeg, lastAccess, target }
 const sessions = new Map();
 const byTarget = new Map(); // url → sid (un solo ffmpeg por canal, lo comparten todos)
