@@ -425,10 +425,12 @@ async function relayFetch(req, res, url) {
     let current = target;
     let r = null;
     for (let redirects = 0; redirects <= 4; redirects++) {
-      current = await validatePublicTarget(current);
-      r = await fetch(current, {
+      const fetched = await pinnedHttpFetch(current, {
         headers: { "user-agent": UA, accept: "*/*" },
-        redirect: "manual",
+        signal: ac.signal,
+      });
+      r = fetched.response;
+      current = fetched.finalUrl;
         signal: ac.signal,
       });
       if (r.status < 300 || r.status >= 400) break;
