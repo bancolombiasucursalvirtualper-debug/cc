@@ -420,7 +420,8 @@ async function relayFetch(req, res, url) {
     return;
   }
   const ac = new AbortController();
-  req.on("close", () => ac.abort());
+  req.on("aborted", () => ac.abort());
+  res.on("close", () => { if (!res.writableEnded) ac.abort(); });
   try {
     let current = target;
     let r = null;
