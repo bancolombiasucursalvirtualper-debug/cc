@@ -269,11 +269,30 @@ async function relayFetch(req, res, url) {
   const ac = new AbortController();
   req.on("close", () => ac.abort());
   try {
-    const r = await fetch(target, {
-      headers: { "user-agent": UA, accept: "*/*" },
-      redirect: "follow",
-      signal: ac.signal,
-    });
+    let current = target;
+    let r = null;
+    for (let redirects = 0; redirects <= 4; redirects++) {
+      current = await validatePublicTarget(current);
+      r = await fetch(current, {
+        headers: { "user-agent": UA, accept: "*/*" },
+        redirect: "manual",
+        signal: ac.signal,
+      });
+      if (r.status < 300 || r.status >= 400) break;
+      const location = r.headers.get("location");
+      if (!location || redirects === 4) {
+        try { await r.body?.cancel(); } catch {}
+        throw new Error("Redirección de origen no válida");
+      }
+      const next = new URL(location, current);
+      if (new URL(current).protocol === "https:" && next.protocol !== "https:") {
+        try { await r.body?.cancel(); } catch {}
+        throw new Error("Redirección HTTPS a HTTP bloqueada");
+      }
+      try { await r.body?.cancel(); } catch {}
+      current = next.href;
+    }
+    if (!r) throw new Error("No hubo respuesta del origen");
     res.writeHead(r.status, {
       ...CORS,
       "content-type": r.headers.get("content-type") || "application/octet-stream",
