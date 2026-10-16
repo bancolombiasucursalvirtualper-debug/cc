@@ -431,8 +431,6 @@ async function relayFetch(req, res, url) {
       });
       r = fetched.response;
       current = fetched.finalUrl;
-        signal: ac.signal,
-      });
       if (r.status < 300 || r.status >= 400) break;
       const location = r.headers.get("location");
       if (!location || redirects === 4) {
