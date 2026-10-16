@@ -1,6 +1,6 @@
 const http = require("http");
 const { spawn } = require("child_process");
-const { randomUUID, timingSafeEqual } = require("crypto");
+const { randomBytes, randomUUID, timingSafeEqual } = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
@@ -117,7 +117,7 @@ function isPublicAddress(address, family = net.isIP(address)) {
   return true;
 }
 
-async function validatePublicTarget(value) {
+async function resolvePublicTarget(value) {
   let parsed;
   try { parsed = new URL(value); } catch { throw new Error("URL de origen inválida"); }
   if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password) throw new Error("URL de origen no permitida");
@@ -126,7 +126,12 @@ async function validatePublicTarget(value) {
   const family = net.isIP(hostname);
   const records = family ? [{ address: hostname, family }] : await dns.lookup(hostname, { all: true, verbatim: true });
   if (!records.length || records.some((record) => !isPublicAddress(record.address, record.family))) throw new Error("El host de origen resuelve a una dirección no pública");
-  return parsed.href;
+  return { url: parsed, address: records[0] };
+}
+
+async function validatePublicTarget(value) {
+  const resolved = await resolvePublicTarget(value);
+  return resolved.url.href;
 }
 // Sesiones activas: sid → { dir, ffmpeg, lastAccess, target }
 const sessions = new Map();
