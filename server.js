@@ -324,7 +324,10 @@ const server = http.createServer(async (req, res) => {
     if (!requireRelayAuth(req, res)) return;
     const target = ALLOWED[play[1]];
     if (!target) { res.writeHead(404, CORS); res.end("Canal no encontrado"); return; }
-    const sid = startSession(target);
+    let safeTarget;
+    try { safeTarget = await validatePublicTarget(target); }
+    catch { res.writeHead(400, CORS); res.end("Destino de origen no permitido"); return; }
+    const sid = startSession(safeTarget);
     try {
       await waitForPlaylist(path.join(sessions.get(sid).dir, "live.m3u8"), 35000);
       res.writeHead(302, { ...CORS, location: `/hls/${sid}/live.m3u8` });
@@ -376,7 +379,10 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ error: "URL http/https requerida" }));
         return;
       }
-      const sid = startSession(parsed.href);
+      let safeTarget;
+      try { safeTarget = await validatePublicTarget(parsed.href); }
+      catch { res.writeHead(400, { ...CORS, "content-type": "application/json" }); res.end(JSON.stringify({ error: "Destino de origen no permitido" })); return; }
+      const sid = startSession(safeTarget);
       const session = sessions.get(sid);
       if (!session) {
         res.writeHead(502, { ...CORS, "content-type": "application/json" });
@@ -414,7 +420,10 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: "Canal no encontrado" }));
       return;
     }
-    const sid = startSession(target);
+    let safeTarget;
+    try { safeTarget = await validatePublicTarget(target); }
+    catch { res.writeHead(400, { ...CORS, "content-type": "application/json" }); res.end(JSON.stringify({ error: "Destino de origen no permitido" })); return; }
+    const sid = startSession(safeTarget);
     res.writeHead(200, { ...CORS, "content-type": "application/json" });
     res.end(JSON.stringify({ sid, playlist: `/hls/${sid}/live.m3u8` }));
     return;
