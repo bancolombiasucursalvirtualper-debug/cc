@@ -128,7 +128,8 @@ async function resolvePublicTarget(value) {
   const family = net.isIP(hostname);
   const records = family ? [{ address: hostname, family }] : await dns.lookup(hostname, { all: true, verbatim: true });
   if (!records.length || records.some((record) => !isPublicAddress(record.address, record.family))) throw new Error("El host de origen resuelve a una dirección no pública");
-  return { url: parsed, address: records[0] };
+  const address = records.find((record) => record.family === 4) || records[0];
+  return { url: parsed, address };
 }
 
 async function validatePublicTarget(value) {
@@ -172,7 +173,7 @@ async function pinnedHttpFetch(value, init = {}) {
   return new Promise((resolve, reject) => {
     const request = client.request({
       protocol: target.protocol,
-      hostname: target.hostname.replace(/^\\[|\\]$/g, ""),
+      hostname: target.hostname.startsWith("[") && target.hostname.endsWith("]") ? target.hostname.slice(1, -1) : target.hostname,
       port: target.port ? Number(target.port) : undefined,
       method,
       path: target.pathname + target.search,
@@ -206,7 +207,7 @@ function hasOutboundProxyAuth(req) {
 }
 function writeConnectError(socket, status, reason) {
   if (socket.destroyed) return;
-  socket.end(`HTTP/1.1 ${status} ${reason}\\r\\nConnection: close\\r\\n\\r\\n`);
+  socket.end(`HTTP/1.1 ${status} ${reason}\r\nConnection: close\r\n\r\n`);
 }
 
 // Loopback-only authenticated proxy used by FFmpeg. HTTP requests and HTTPS CONNECT tunnels
@@ -262,7 +263,7 @@ outboundProxyServer.on("connect", async (req, clientSocket, head) => {
     upstream.once("connect", () => {
       connected = true;
       clearTimeout(timer);
-      clientSocket.write("HTTP/1.1 200 Connection Established\\r\\nProxy-Agent: MiTube-Relay\\r\\n\\r\\n");
+      clientSocket.write("HTTP/1.1 200 Connection Established\r\nProxy-Agent: MiTube-Relay\r\n\r\n");
       if (head && head.length) upstream.write(head);
       clientSocket.pipe(upstream);
       upstream.pipe(clientSocket);
