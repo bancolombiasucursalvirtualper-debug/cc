@@ -1,4 +1,6 @@
-const http = require("http");
+const http = require("node:http");
+const https = require("node:https");
+const { Readable } = require("node:stream");
 const { spawn } = require("child_process");
 const { randomBytes, randomUUID, timingSafeEqual } = require("crypto");
 const fs = require("fs");
@@ -133,6 +135,149 @@ async function validatePublicTarget(value) {
   const resolved = await resolvePublicTarget(value);
   return resolved.url.href;
 }
+function pinnedLookupFor(address) {
+  return (_hostname, options, callback) => {
+    if (typeof options === "function") { callback = options; options = {}; }
+    if (options && options.all) callback(null, [{ address: address.address, family: address.family }]);
+    else callback(null, address.address, address.family);
+  };
+}
+
+function forwardedHeaders(source) {
+  const result = new Headers();
+  const hopByHop = new Set(["connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade"]);
+  for (const [name, raw] of Object.entries(source)) {
+    if (raw === undefined || hopByHop.has(name.toLowerCase())) continue;
+    if (Array.isArray(raw)) {
+      if (name.toLowerCase() === "set-cookie") raw.forEach((value) => result.append(name, value));
+      else result.set(name, raw.join(", "));
+    } else result.set(name, String(raw));
+  }
+  return result;
+}
+
+// One upstream HTTP(S) request. DNS is resolved/checked here and the socket uses exactly that answer.
+async function pinnedHttpFetch(value, init = {}) {
+  const resolved = await resolvePublicTarget(value);
+  const target = resolved.url;
+  const address = resolved.address;
+  const method = init.method || "GET";
+  if (method !== "GET" && method !== "HEAD") throw new Error("Método de salida no permitido");
+  const client = target.protocol === "https:" ? https : http;
+  const headers = {};
+  new Headers(init.headers).forEach((headerValue, name) => { headers[name] = headerValue; });
+  delete headers["proxy-authorization"];
+  delete headers["proxy-connection"];
+  if (!headers.host) headers.host = target.host;
+  return new Promise((resolve, reject) => {
+    const request = client.request({
+      protocol: target.protocol,
+      hostname: target.hostname.replace(/^\\[|\\]$/g, ""),
+      port: target.port ? Number(target.port) : undefined,
+      method,
+      path: target.pathname + target.search,
+      headers,
+      agent: false,
+      lookup: pinnedLookupFor(address),
+      signal: init.signal || undefined,
+    }, (upstream) => {
+      const status = upstream.statusCode || 502;
+      if (status < 200) { upstream.destroy(); reject(new Error("Respuesta de origen no válida")); return; }
+      const body = method === "HEAD" || [204, 205, 304].includes(status) ? null : Readable.toWeb(upstream);
+      resolve({
+        response: new Response(body, { status, statusText: upstream.statusMessage, headers: forwardedHeaders(upstream.headers) }),
+        finalUrl: target.href,
+      });
+    });
+    request.on("error", reject);
+    request.setTimeout(20000, () => request.destroy(new Error("Tiempo de espera de origen agotado")));
+    request.end();
+  });
+}
+
+const OUTBOUND_PROXY_USER = "mitube-relay";
+const OUTBOUND_PROXY_PASSWORD = randomBytes(32).toString("hex");
+let OUTBOUND_PROXY_URL = "";
+function expectedProxyAuthorization() {
+  return "Basic " + Buffer.from(`${OUTBOUND_PROXY_USER}:${OUTBOUND_PROXY_PASSWORD}`).toString("base64");
+}
+function hasOutboundProxyAuth(req) {
+  return safeEqual(req.headers["proxy-authorization"], expectedProxyAuthorization());
+}
+function writeConnectError(socket, status, reason) {
+  if (socket.destroyed) return;
+  socket.end(`HTTP/1.1 ${status} ${reason}\\r\\nConnection: close\\r\\n\\r\\n`);
+}
+
+// Loopback-only authenticated proxy used by FFmpeg. HTTP requests and HTTPS CONNECT tunnels
+// resolve and validate every destination; HTTPS TLS/SNI remains end-to-end inside the tunnel.
+const outboundProxyServer = http.createServer(async (req, res) => {
+  if (!hasOutboundProxyAuth(req)) {
+    res.writeHead(407, { "proxy-authenticate": 'Basic realm="MiTube relay"', connection: "close" });
+    res.end();
+    return;
+  }
+  if (req.method !== "GET" && req.method !== "HEAD") { res.writeHead(405, { connection: "close" }); res.end(); return; }
+  let target;
+  try {
+    const raw = req.url || "/";
+    target = raw.startsWith("http://") || raw.startsWith("https://")
+      ? new URL(raw)
+      : new URL(raw, `http://${req.headers.host || ""}`);
+  } catch { res.writeHead(400, { connection: "close" }); res.end(); return; }
+  if (target.protocol !== "http:") { res.writeHead(400, { connection: "close" }); res.end(); return; }
+  try {
+    const cleanHeaders = {};
+    for (const [name, value] of Object.entries(req.headers)) {
+      if (["proxy-authorization", "proxy-connection", "connection", "keep-alive", "transfer-encoding", "upgrade", "te", "trailer"].includes(name.toLowerCase()) || value === undefined) continue;
+      cleanHeaders[name] = value;
+    }
+    cleanHeaders.host = target.host;
+    const pinned = await pinnedHttpFetch(target.href, { method: req.method, headers: cleanHeaders });
+    res.writeHead(pinned.response.status, Object.fromEntries(pinned.response.headers.entries()));
+    if (!pinned.response.body) { res.end(); return; }
+    for await (const chunk of pinned.response.body) {
+      if (!res.write(Buffer.from(chunk))) await new Promise((resolve) => res.once("drain", resolve));
+    }
+    res.end();
+  } catch {
+    if (!res.headersSent) res.writeHead(502, { connection: "close" });
+    res.end();
+  }
+});
+
+outboundProxyServer.on("connect", async (req, clientSocket, head) => {
+  if (!hasOutboundProxyAuth(req)) { writeConnectError(clientSocket, 407, "Proxy Authentication Required"); return; }
+  let target;
+  try { target = new URL(`https://${req.url || ""}`); }
+  catch { writeConnectError(clientSocket, 400, "Bad Request"); return; }
+  if (target.pathname !== "/" || target.search || target.hash || target.username || target.password) { writeConnectError(clientSocket, 400, "Bad Request"); return; }
+  const port = target.port ? Number(target.port) : 443;
+  if (!Number.isInteger(port) || port < 1 || port > 65535) { writeConnectError(clientSocket, 400, "Bad Request"); return; }
+  try {
+    const resolved = await resolvePublicTarget(target.href);
+    const upstream = net.connect({ host: resolved.address.address, port, family: resolved.address.family });
+    let connected = false;
+    const timer = setTimeout(() => upstream.destroy(new Error("Tiempo de espera de origen agotado")), 15000);
+    upstream.once("connect", () => {
+      connected = true;
+      clearTimeout(timer);
+      clientSocket.write("HTTP/1.1 200 Connection Established\\r\\nProxy-Agent: MiTube-Relay\\r\\n\\r\\n");
+      if (head && head.length) upstream.write(head);
+      clientSocket.pipe(upstream);
+      upstream.pipe(clientSocket);
+    });
+    upstream.on("error", () => {
+      clearTimeout(timer);
+      if (!connected) writeConnectError(clientSocket, 502, "Bad Gateway");
+      clientSocket.destroy();
+    });
+    clientSocket.on("error", () => upstream.destroy());
+    clientSocket.on("close", () => upstream.destroy());
+  } catch { writeConnectError(clientSocket, 403, "Forbidden"); }
+});
+outboundProxyServer.on("clientError", (_error, socket) => writeConnectError(socket, 400, "Bad Request"));
+
 // Sesiones activas: sid → { dir, ffmpeg, lastAccess, target }
 const sessions = new Map();
 const byTarget = new Map(); // url → sid (un solo ffmpeg por canal, lo comparten todos)
